@@ -3611,6 +3611,10 @@ void Player::GiveXP(uint32 xp, Unit* victim)
     if (!IsAlive())
         return;
 
+    if (HasChallenge(CHALLENGE_BREWMASTER) &&
+        GetDrunkenstateByValue(GetDrunkValue()) != DRUNKEN_SMASHED)
+        return;
+
     uint32 level = GetLevel();
 
     if (IsHardcore() && InBattleGround())
@@ -3798,6 +3802,15 @@ void Player::GiveLevel(uint32 level)
         }
     }
 
+    if (HasChallenge(CHALLENGE_CRAFTMASTER) && level == PLAYER_MAX_LEVEL)
+        AwardTitle(TITLE_CRAFTMASTER);
+
+    if (HasChallenge(CHALLENGE_BREWMASTER) && level == PLAYER_MAX_LEVEL)
+    {
+        AwardTitle(TITLE_BREWMASTER);
+        MailBrewmasterModeRewards();
+    }
+
     if (HasChallenge(CHALLENGE_BOARING_MODE))
     {
         if (level == PLAYER_MAX_LEVEL)
@@ -3882,22 +3895,16 @@ void Player::GiveLevel(uint32 level)
             BattleGroundTypeId bgTypeId = BattleGroundMgr::BGTemplateId(bgQueueTypeId);
             if (GetBattleGroundBracketIdFromLevel(bgTypeId, level) != GetBattleGroundBracketIdFromLevel(bgTypeId, GetLevel()))
             {
-                BattleGroundQueue& bgQueue = sBattleGroundMgr.m_BattleGroundQueues[bgQueueTypeId];
-                GroupQueueInfo ginfo;
-                if (!bgQueue.GetPlayerGroupInfoData(GetObjectGuid(), &ginfo))
-                    continue;
+                BattleGroundBracketId const oldBracketId = GetBattleGroundBracketIdFromLevel(bgTypeId, GetLevel());
 
-                BattleGround* bg = sBattleGroundMgr.GetBattleGround(ginfo.IsInvitedToBGInstanceGUID, bgTypeId);
-                if (!bg)
-                    bg = sBattleGroundMgr.GetBattleGroundTemplate(bgTypeId);
-
+                // Player::GiveLevel can run on a map worker. Keep only player-local
+                // state and the client notification here; the global queue belongs
+                // to the world thread and is cleaned up after map updates finish.
                 WorldPacket data;
-                RemoveBattleGroundQueueId(bgQueueTypeId);  // must be called this way, because if you move this call to queue->removeplayer, it causes bugs
-                sBattleGroundMgr.BuildBattleGroundStatusPacket(&data, bg, queueSlot, STATUS_NONE, 0, 0);
-                bgQueue.RemovePlayer(GetObjectGuid(), true);
-                // player left queue, we should update it
-                sBattleGroundMgr.ScheduleQueueUpdate(bgQueueTypeId, bgTypeId, GetBattleGroundBracketIdFromLevel(bgTypeId, GetLevel()));
+                RemoveBattleGroundQueueId(bgQueueTypeId);
+                sBattleGroundMgr.BuildBattleGroundStatusPacket(&data, nullptr, queueSlot, STATUS_NONE, 0, 0);
                 GetSession()->SendPacket(&data);
+                sBattleGroundMgr.ScheduleQueueBracketCleanup(GetObjectGuid(), bgQueueTypeId, bgTypeId, oldBracketId);
             }
         }
     }
@@ -7007,7 +7014,7 @@ void Player::UpdateSkillsForLevel()
         if (!pSkill)
             continue;
 
-        SkillRaceClassInfoEntry const* rcEntry = GetSkillRaceClassInfo(pskill, GetRace(), GetClass());
+        SkillRaceClassInfoEntry const* rcEntry = sSpellMgr.GetSkillRaceClassInfo(pskill, GetRace(), GetClass());
         if (!rcEntry)
             continue;
 
@@ -7379,7 +7386,7 @@ void Player::UpdateSpellTrainedSkills(uint32 spellId, bool apply, bool hardReset
                 if (HasSkill(uint16(pSkill->id)))
                     continue;
 
-                SkillRaceClassInfoEntry const* rcInfo = GetSkillRaceClassInfo(pSkill->id, GetRace(), GetClass());
+                SkillRaceClassInfoEntry const* rcInfo = sSpellMgr.GetSkillRaceClassInfo(pSkill->id, GetRace(), GetClass());
                 if (!rcInfo)
                     continue;
 
@@ -7978,7 +7985,7 @@ uint32 Player::GetGuildIdFromDB(ObjectGuid guid)
 
 uint32 Player::GetRankFromDB(ObjectGuid guid)
 {
-    QueryResult *result = CharacterDatabase.PQuery("SELECT rank FROM guild_member WHERE guid='%u'", guid.GetCounter());
+    QueryResult *result = CharacterDatabase.PQuery("SELECT `rank` FROM guild_member WHERE guid='%u'", guid.GetCounter());
     if (result)
     {
         uint32 v = result->Fetch()[0].GetUInt32();
@@ -11675,6 +11682,14 @@ InventoryResult Player::CanEquipItem(uint8 slot, uint16 &dest, ItemPrototype con
 
             if (IsInCombat() && pProto->Class == ITEM_CLASS_WEAPON && m_weaponChangeTimer != 0)
                 return EQUIP_ERR_CANT_DO_RIGHT_NOW;         // maybe exist better err
+
+            if (HasChallenge(CHALLENGE_CRAFTMASTER) && GetLevel() < PLAYER_MAX_LEVEL &&
+                pProto->InventoryType != INVTYPE_TABARD &&
+                (!pItem || pItem->GetGuidValue(ITEM_FIELD_CREATOR) != GetObjectGuid()))
+            {
+                GetSession()->SendNotification("You can only equip items you crafted yourself in the Traveling Craftmaster challenge.");
+                return EQUIP_ERR_CANT_DO_RIGHT_NOW;
+            }
 
             if (HasChallenge(CHALLENGE_VAGRANT_MODE) && GetLevel() < PLAYER_MAX_LEVEL)
             {
@@ -21500,9 +21515,9 @@ bool Player::IsSpellFitByClassAndRace(uint32 spell_id, uint32* pReqlevel /*= nul
             continue;
 
         SkillRaceClassInfoMapBounds bounds = sSpellMgr.GetSkillRaceClassInfoMapBounds(abilityEntry->skillId);
-        for (SkillRaceClassInfoMap::const_iterator itr = bounds.first; itr != bounds.second; ++itr)
+        for (SkillRaceClassInfoValueMap::const_iterator itr = bounds.first; itr != bounds.second; ++itr)
         {
-            SkillRaceClassInfoEntry const* skillRCEntry = itr->second;
+            SkillRaceClassInfoEntry const* skillRCEntry = &itr->second;
             if ((skillRCEntry->raceMask & racemask) && (skillRCEntry->classMask & classmask))
             {
                 if (skillRCEntry->flags & ABILITY_SKILL_NONTRAINABLE)
@@ -22523,7 +22538,7 @@ void Player::_LoadSkills(QueryResult *result)
                 continue;
             }
 
-            SkillRaceClassInfoEntry const* rcEntry = GetSkillRaceClassInfo(skill, GetRace(), GetClass());
+            SkillRaceClassInfoEntry const* rcEntry = sSpellMgr.GetSkillRaceClassInfo(skill, GetRace(), GetClass());
             if (!rcEntry)
             {
                 sLog.outError("Character %u has forbidden skill %u for his race / class combination.", GetGUIDLow(), skill);
@@ -24480,6 +24495,16 @@ void Player::MailBoaringModeRewards(uint32 level)
         .SendMailTo(this, MailSender(MAIL_CREATURE, uint32(16547), MAIL_STATIONERY_DEFAULT), MAIL_CHECK_MASK_COPIED, 0, 30 * DAY);
 }
 
+void Player::MailBrewmasterModeRewards()
+{
+    Item* reward = Item::CreateItem(GetTeam() == ALLIANCE ? 81234 : 80455, 1, this);
+    reward->SaveToDB();
+
+    MailDraft("Master of the Brew", "Congratulations on reaching level 60 while walking the Path of the Brewmaster! Accept this Brewfest mount as a reward for your spirited journey.")
+        .AddItem(reward)
+        .SendMailTo(this, MailSender(MAIL_CREATURE, uint32(16547), MAIL_STATIONERY_DEFAULT), MAIL_CHECK_MASK_COPIED, 0, 30 * DAY);
+}
+
 bool Player::IsCityProtector() { return HasTitle(GetRace()); /*GetByteValue(PLAYER_BYTES_3, 2) == GetRace();*/ }
 bool Player::IsImmortal() { return GetByteValue(PLAYER_BYTES_3, 2) == 52; }
 bool Player::IsScarabLord() { return HasItemCount(21176, 1, 0); }
@@ -24571,100 +24596,9 @@ void Player::SetFlying(bool flying)
 
 void Player::AddToArenaQueue(bool queuedAsGroup)
 {
-    if (!IsInWorld() || !IsAlive())
-        return;
-
-    // only max level
-    if (GetLevel() < sWorld.getConfig(CONFIG_UINT32_MAX_PLAYER_LEVEL))
-        return;
-
-    /* // check if in other queues
-    if (InBattleGroundQueue())
-    {
-        GetSession()->SendNotification("Unable to queue while currently in another queue.");
-        return;
-    } */
-
-    // is deserter?
-    if (!CanJoinToBattleground())
-    {
-        GetSession()->SendNotification("Unable to queue while you are marked as Deserter");
-        return;
-    }
-
-    // check existence
-    BattleGround* bg = nullptr;
-    if (!(bg = sBattleGroundMgr.GetBattleGroundTemplate(BATTLEGROUND_BR)))
-    {
-        sLog.outError("Battleground: template BG (all arenas) not found");
-        return;
-    }
-
-    BattleGroundQueueTypeId bgQueueTypeId = sBattleGroundMgr.BGQueueTypeId(bg->GetTypeID());
-    BattleGroundTypeId bgTypeId = GetBattleGroundTypeIdByMapId(bg->GetMapId());
-    BattleGroundBracketId const bgBracketId = GetBattleGroundBracketIdFromLevel(bgTypeId);
-    uint32 arenaRating = 0;
-
-    // You can't queue as group
-    Group* grp = GetGroup();
-    if (grp)
-    {
-        uint32 err = grp->CanJoinArenaQueue(bgQueueTypeId, 3, 3, sObjectMgr.GetPlayer(grp->GetLeaderGuid()));
-        if (err == BG_JOIN_ERR_GROUP_DESERTER)
-        {
-            WorldPacket data;
-            sBattleGroundMgr.BuildGroupJoinedBattlegroundPacket(&data, BG_GROUPJOIN_DESERTERS);
-            GetSession()->SendPacket(&data);
-            GetSession()->SendBattleGroundJoinError(err);
-            return;
-        }
-        else if (err != BG_JOIN_ERR_OK)
-        {
-            GetSession()->SendBattleGroundJoinError(err);
-            return;
-        }
-    }
-
-    BattleGroundQueue& bgQueue = sBattleGroundMgr.m_BattleGroundQueues[bgQueueTypeId];
-    GroupQueueInfo * ginfo = bgQueue.AddGroup(this, grp ? grp : nullptr, bgTypeId, bgBracketId, false, 0, nullptr);
-    uint32 avgTime = bgQueue.GetAverageQueueWaitTime(ginfo, bgBracketId);
-    
-    if (grp && queuedAsGroup)
-    {
-        for (GroupReference *itr = grp->GetFirstMember(); itr != nullptr; itr = itr->next())
-        {
-            Player *member = itr->getSource();
-            if (!member)
-                continue;  // this should never happen
-
-            uint32 queueSlot = member->AddBattleGroundQueueId(bgQueueTypeId); // add to queue
-            member->SetBattleGroundEntryPoint(this, false); // store entry point coords
-
-            WorldPacket data;
-            // send status packet (in queue)
-            sBattleGroundMgr.BuildBattleGroundStatusPacket(&data, bg, queueSlot, STATUS_WAIT_QUEUE, avgTime, 0);
-            member->GetSession()->SendPacket(&data);
-
-            if (grp->GetMembersCount() > 1)
-            {
-                sBattleGroundMgr.BuildGroupJoinedBattlegroundPacket(&data, bg->GetMapId());
-                member->GetSession()->SendPacket(&data);
-            }
-        }
-    }
-    else // solo
-    {
-        // already checked if queueSlot is valid, now just get it
-        uint32 queueSlot = AddBattleGroundQueueId(bgQueueTypeId);
-
-        SetBattleGroundEntryPoint(this, false);
-
-        WorldPacket data;
-        sBattleGroundMgr.BuildBattleGroundStatusPacket(&data, bg, queueSlot, STATUS_WAIT_QUEUE, avgTime, 0);
-        GetSession()->SendPacket(&data);
-    }
-
-    sBattleGroundMgr.ScheduleQueueUpdate(bgQueueTypeId, bgTypeId, bgBracketId);
+    // Gossip scripts run on map workers. BattleGroundQueue state is owned by
+    // the world thread, so only enqueue the value-only arena join request here.
+    sBattleGroundMgr.ScheduleArenaQueueJoin(GetObjectGuid(), queuedAsGroup);
 }
 
 uint16 Player::GetPureMaxSkillValue(uint32 skill) const
@@ -25501,6 +25435,18 @@ bool Player::HasEarnedTitle(uint8 titleId)
     case TITLE_THE_WANDERER:
     {
         if (GetLevel() == PLAYER_MAX_LEVEL && HasChallenge(CHALLENGE_VAGRANT_MODE))
+            return true;
+        break;
+    }
+    case TITLE_CRAFTMASTER:
+    {
+        if (GetLevel() == PLAYER_MAX_LEVEL && HasChallenge(CHALLENGE_CRAFTMASTER))
+            return true;
+        break;
+    }
+    case TITLE_BREWMASTER:
+    {
+        if (GetLevel() == PLAYER_MAX_LEVEL && HasChallenge(CHALLENGE_BREWMASTER))
             return true;
         break;
     }

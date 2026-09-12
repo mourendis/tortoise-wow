@@ -52,6 +52,7 @@
 #include "Chat.h"
 #include "Anticheat.h"
 #include "ScriptObjects.h"
+#include "SpellClassMask.h"
 
 #include "packet_builder.h"
 #include "MovementBroadcaster.h"
@@ -3773,10 +3774,8 @@ float WorldObject::MeleeSpellMissChance(Unit* pVictim, WeaponAttackType attType,
     // PvP - PvE melee chances
     if (pVictim->GetTypeId() == TYPEID_PLAYER)
         missChance = 5.0f - skillDiff * 0.04f;
-    else if (skillDiff < -10)
-        missChance = 5.0f - skillDiff * 0.2f;
     else
-        missChance = 5.0f - skillDiff * 0.1f;
+        missChance = 5.0f - skillDiff * 0.2f;
 
     // Low level reduction
     if (!pVictim->IsPlayer() && pVictim->GetLevel() < 10)
@@ -3808,12 +3807,6 @@ float WorldObject::MeleeSpellMissChance(Unit* pVictim, WeaponAttackType attType,
             }
         }
     } 
-
-    // There is some code in 1.12 that explicitly adds a modifier that causes the first 1% of +hit gained from
-    // talents or gear to be ignored against monsters with more than 10 Defense Skill above the attacking players Weapon Skill.
-    // https://us.forums.blizzard.com/en/wow/t/bug-hit-tables/185675/33
-    if (skillDiff < -10 && hitChance > 0)
-        hitChance -= 1.0f;
 
     // Hit chance depends from victim auras
     if (attType == RANGED_ATTACK)
@@ -4763,6 +4756,25 @@ uint32 WorldObject::SpellHealingBonusDone(Unit* pVictim, SpellEntry const* spell
                 case 3736: // Hateful Totem of the Third Wind / Increased Lesser Healing Wave / Savage Totem of the Third Wind
                     DoneTotal += i->GetModifier()->m_amount;
                     break;
+                case 5069: // Spiritual Healing
+                    DoneTotalMod *= (100.0f + i->GetModifier()->m_amount) / 100.0f;
+                    break;
+                case 5065: // Empowered Recovery
+                {
+                    if (!pVictim)
+                        break;
+
+                    Unit::AuraList const& periodicHeals = pVictim->GetAurasByType(SPELL_AURA_PERIODIC_HEAL);
+                    for (Aura const* aura : periodicHeals)
+                    {
+                        if (aura->GetSpellProto()->IsFitToFamily<SPELLFAMILY_PRIEST, CF_PRIEST_RENEW>())
+                        {
+                            DoneTotalMod *= (100.0f + i->GetModifier()->m_amount) / 100.0f;
+                            break;
+                        }
+                    }
+                    break;
+                }
                 default:
                     break;
             }

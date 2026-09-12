@@ -1716,9 +1716,12 @@ void Unit::CalculateMeleeDamage(Unit* pVictim, uint32 damage, CalcDamageInfo *da
             // High end : 1.2 - 0.03*(defense - skill) min of 0.2 and max of 0.99
             // If the attacker is a caster then this is reduced by 0.3
 
-            int32 skillDiff = pVictim->GetDefenseSkillValue(this) - GetWeaponSkillValue(damageInfo->attackType, pVictim);
-            float low = 1.3f - 0.05f * skillDiff;
-            float high = 1.2f - 0.03f * skillDiff;
+            int32 const weaponSkill = GetWeaponSkillValue(damageInfo->attackType, pVictim);
+            int32 skillDiff = pVictim->GetDefenseSkillValue(this) - weaponSkill;
+            int32 const extraWeaponSkill = std::max(weaponSkill - int32(GetSkillMaxForLevel(pVictim)), 0);
+
+            float low = 1.3f - 0.05f * skillDiff - 0.03f * extraWeaponSkill;
+            float high = 1.2f - 0.03f * skillDiff - 0.01f * extraWeaponSkill;
             float lowCap = 0.91f;
             float highCap = 0.99f;
 
@@ -2135,28 +2138,6 @@ void Unit::CalculateDamageAbsorbAndResist(WorldObject *pCaster, SpellSchoolMask 
         if (mod->m_amount <= 0)
             existExpired = true;
 
-        // CUSTOM priest talent Reflective Shields
-        if (aura->GetSpellProto()->IsFitToFamily<SPELLFAMILY_PRIEST, CF_PRIEST_POWER_WORD_SHIELD>())
-        {
-            if (const auto caster = aura->GetCaster(); caster && caster->HasAura(45560))
-            {
-                // 20% of currentAbsorb
-                int32_t const reflect_damage = currentAbsorb * 0.2f;
-                if (reflect_damage)
-                {
-                    m_Events.AddLambdaEventAtOffset([this, victimGuid = pCaster->GetObjectGuid(), reflect_damage]()
-                        {
-                            if (Map* map = FindMap())
-                            {
-                                if (Unit* victim = map->GetUnit(victimGuid))
-                                {
-                                    CastCustomSpell(victim, 45561, &reflect_damage, nullptr, nullptr, true);
-                                }
-                            }
-                        }, 1);
-                }
-            }
-        }
     }
 
     // Remove all expired absorb auras
@@ -2902,10 +2883,8 @@ float Unit::MeleeMissChanceCalc(Unit const* pVictim, WeaponAttackType attType) c
     // PvP - PvE melee chances
     if (pVictim->IsPlayer())
         skillDiffBonus = skillDiff * 0.04f;
-    else if (skillDiff < -10)
-        skillDiffBonus = skillDiff * 0.2f;
     else
-        skillDiffBonus = skillDiff * 0.1f;
+        skillDiffBonus = skillDiff * 0.2f;
     missChance -= skillDiffBonus;
 
     // Low level reduction
@@ -2933,12 +2912,6 @@ float Unit::MeleeMissChanceCalc(Unit const* pVictim, WeaponAttackType attType) c
                 hitChance += owner->m_modSpellHitChance * aura->GetModifier()->m_amount / 100.0f;
         }
     }
-
-    // There is some code in 1.12 that explicitly adds a modifier that causes the first 1% of +hit gained from
-    // talents or gear to be ignored against monsters with more than 10 Defense Skill above the attacking player’s Weapon Skill.
-    // https://us.forums.blizzard.com/en/wow/t/bug-hit-tables/185675/33
-    if (skillDiff < -10 && hitChance > 0.0f)
-        hitChance -= 1.0f;
 
     missChance -= hitChance;
 
@@ -4384,39 +4357,6 @@ void Unit::RemoveSpellAuraHolder(SpellAuraHolder *holder, AuraRemoveMode mode)
     if (!foundInMap)
         sLog.outInfo("[Crash/Auras] Removing aura holder *not* in holders map ! Aura %u on %s", holder->GetId(), GetName());
     holder->SetRemoveMode(mode);
-
-    // Resurgent Shield
-    if (mode == AURA_REMOVE_BY_SHIELD_BREAK &&
-        holder->GetSpellProto()->IsFitToFamily<SPELLFAMILY_PRIEST, CF_PRIEST_POWER_WORD_SHIELD>())
-    {
-        if (Unit* caster = holder->GetCaster())
-            if (caster->HasAura(45560))
-            {
-                // Determine initial absorb amount from the shield aura.
-                int32 totalAbsorb = 0;
-                for (int i = 0; i < MAX_EFFECT_INDEX; ++i)
-                {
-                    if (Aura* aura = holder->GetAuraByEffectIndex(SpellEffectIndex(i)))
-                    {
-                        if (aura->GetModifier()->m_auraname == SPELL_AURA_SCHOOL_ABSORB)
-                        {
-                            totalAbsorb = aura->GetInitialAbsorbAmount();
-                            break;
-                        }
-                    }
-                }
-
-                // Fallback if no snapshot was found.
-                if (totalAbsorb <= 0)
-                    totalAbsorb = 0;
-
-                int32 base1 = totalAbsorb / 10;
-                int32 base2 = totalAbsorb / 10;
-                int32 base3 = static_cast<int32>(holder->GetSpellProto()->manaCost);
-
-                caster->CastCustomSpell(caster, 51477, &base1, &base2, &base3, true);
-            }
-    }
 
     holder->UnregisterSingleCastHolder();
     holder->HandleCastOnAuraRemoval();
